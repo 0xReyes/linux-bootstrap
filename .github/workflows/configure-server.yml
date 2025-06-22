@@ -1,4 +1,4 @@
-name: Secure Bastion Host Deployment
+name: Deployment
 
 on:
   push:
@@ -28,7 +28,7 @@ jobs:
             CONFIG_DIR="/tmp/server-config-${{ github.run_id }}"
             mkdir -p "$CONFIG_DIR"
             
-            # Copy configuration via tar (more reliable than individual files)
+            # Copy configuration via tar
             tar -cf - . | ssh -o StrictHostKeyChecking=no \
               ${{ secrets.SSH_USER }}@${{ github.event.inputs.target_host || secrets.BASTION_HOST }} \
               "tar -xf - -C '$CONFIG_DIR'"
@@ -49,12 +49,11 @@ jobs:
             ${{ secrets.SSH_USER }}@${{ github.event.inputs.target_host || secrets.BASTION_HOST }}:/var/log/server-config-*.log logs/ || echo "No logs found"
           
           # If no logs, create empty file to prevent workflow failure
-          [ -z "$(ls -A logs/)" ] && touch logs/no-logs-found.txt
+          [ -z "$(ls -A logs)" ] && touch logs/no-logs-found.txt
 
       - name: Upload Artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: bastion-logs-${{ github.run_id }}
-          path: logs/
-          retention-days: 3
+          path: logs
