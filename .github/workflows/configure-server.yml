@@ -21,18 +21,48 @@ jobs:
           echo "${{ secrets.TEST_SSH_PUBKEY }}" > test-config/home/testuser/.ssh/authorized_keys
           chmod 600 test-config/home/testuser/.ssh/authorized_keys
           chmod +x test-config/scripts/*.sh
+          
+          # Add SSH debugging config
+          echo "LogLevel DEBUG3" >> test-config/etc/ssh/sshd_config
+          echo "SyslogFacility AUTH" >> test-config/etc/ssh/sshd_config
 
       - name: Build Test Container
         run: docker build -t bastion-test .
 
       - name: Run Container Tests
         run: |
+          # Start container with debug output
           docker run -d --name test-container -p 2222:22 \
             -v "$(pwd)/test-config:/tmp/server-config" bastion-test
-          sleep 15  # Wait for services to start
+          
+          # Wait with service check
+          for i in {1..10}; do
+            if docker exec test-container service ssh status | grep -q "running"; then
+              echo "SSH is running"
+              break
+            fi
+            sleep 3
+            echo "Waiting for SSH to start ($i/10)..."
+          done
+          
+          # Debugging outputs
+          echo "=== Container Status ==="
+          docker ps -a
+          
+          echo "=== SSH Service Status ==="
+          docker exec test-container service ssh status || true
+          
+          echo "=== SSH Process Check ==="
+          docker exec test-container ps aux | grep sshd || true
+          
+          echo "=== Port Listening Check ==="
+          docker exec test-container netstat -tuln | grep ':22' || true
+          
+          echo "=== Container Logs ==="
+          docker logs test-container
           
           # Test SSH connectivity
-          ssh -p 2222 -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+          ssh -vvv -p 2222 -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
             testuser@localhost echo "Container SSH test passed"
           
           # Verify services
@@ -45,8 +75,8 @@ jobs:
           docker stop test-container || true
           docker rm test-container || true
 
-  deploy:
-    name: Deploy
+  deploy-production:
+    name: Deploy to Production
     runs-on: ubuntu-latest
     needs: test-configuration
     if: ${{ github.ref == 'refs/heads/main' }}
@@ -55,15 +85,12 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Prepare Files
+      - name: Prepare Production Files
         run: |
-          # Create config structure
-          mkdir -p config
-          cp -r etc scripts home config/
-          
-          # Set permissions
-          chmod 600 config/home/root/.ssh/authorized_keys
-          chmod +x config/scripts/*.sh
+          mkdir -p production-config
+          cp -r etc scripts home production-config/
+          chmod 600 production-config/home/root/.ssh/authorized_keys
+          chmod +x production-config/scripts/*.sh
 
       - name: Deploy to Server
         uses: appleboy/scp-action@v1.0.0
@@ -71,28 +98,52 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "config/*"
+          source: "production-config/*"
           target: "/tmp/server-config"
           strip_components: 1
 
-      - name: Run Setup
+      - name: Run Production Setup
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            sudo bash /tmp/server-config/scripts/bastion-setup.sh /tmp/server-config
-            sudo rm -rf /tmp/server-config  # Cleanup after installation
+            # Create rescue snapshot
+            sudo cp -a /etc/ssh /etc/ssh.backup
+            sudo cp -a /etc/fail2ban /etc/fail2ban.backup
+            
+            # Run setup with connection keepalive
+            sudo sed -i 's/#ClientAliveInterval 0/ClientAliveInterval 60/' /etc/ssh/sshd_config
+            sudo systemctl reload sshd
+            
+            # Execute setup
+            sudo nohup bash /tmp/server-config/scripts/bastion-setup.sh /tmp/server-config > /tmp/setup.log 2>&1 &
+            
+            # Monitor progress
+            sleep 10  # Initial delay
+            for i in {1..30}; do
+              if sudo grep -q "=== Configuration completed successfully ===" /tmp/setup.log; then
+                echo "Setup completed"
+                break
+              fi
+              sleep 10
+              echo "Waiting for setup to complete ($i/30)..."
+            done
+            
+            # Final status check
+            sudo tail -n 50 /tmp/setup.log
+            sudo rm -rf /tmp/server-config
 
-      - name: Verify Setup
+      - name: Verify Production Setup
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            sudo sshd -t
+            sudo sshd -t && echo "SSH config valid"
             sudo ufw status | grep "Status: active"
             sudo fail2ban-client status sshd | grep "Status: active"
-            echo "configuration verified"
+            ssh -o StrictHostKeyChecking=no localhost echo "Production SSH verified"
+            echo "Configuration successful"
