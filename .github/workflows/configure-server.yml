@@ -45,8 +45,8 @@ jobs:
           docker stop test-container || true
           docker rm test-container || true
 
-  deploy-production:
-    name: Deploy to Production
+  deploy:
+    name: Deploy
     runs-on: ubuntu-latest
     needs: test-configuration
     if: ${{ github.ref == 'refs/heads/main' }}
@@ -55,15 +55,15 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Prepare Production Files
+      - name: Prepare Files
         run: |
-          # Create production config structure
-          mkdir -p production-config
-          cp -r etc scripts home production-config/
+          # Create config structure
+          mkdir -p config
+          cp -r etc scripts home config/
           
           # Set permissions
-          chmod 600 production-config/home/root/.ssh/authorized_keys
-          chmod +x production-config/scripts/*.sh
+          chmod 600 config/home/root/.ssh/authorized_keys
+          chmod +x config/scripts/*.sh
 
       - name: Deploy to Server
         uses: appleboy/scp-action@v1.0.0
@@ -71,11 +71,11 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: "production-config/*"
+          source: "config/*"
           target: "/tmp/server-config"
           strip_components: 1
 
-      - name: Run Production Setup
+      - name: Run Setup
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -85,7 +85,7 @@ jobs:
             sudo bash /tmp/server-config/scripts/bastion-setup.sh /tmp/server-config
             sudo rm -rf /tmp/server-config  # Cleanup after installation
 
-      - name: Verify Production Setup
+      - name: Verify Setup
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -95,4 +95,4 @@ jobs:
             sudo sshd -t
             sudo ufw status | grep "Status: active"
             sudo fail2ban-client status sshd | grep "Status: active"
-            echo "Production configuration verified"
+            echo "configuration verified"
