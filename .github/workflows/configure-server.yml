@@ -1,59 +1,147 @@
-name: Deployment
+name: Server Configuration Pipeline
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      target_host:
-        description: 'Bastion Host IP'
-        required: true
 
 jobs:
-  deploy:
+  test-configuration:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Deploy Configuration
-        uses: appleboy/ssh-action@v1.0.0
-        id: deploy
+      - name: Prepare Test Environment
+        run: |
+          mkdir -p test-config/{etc/ssh,etc/fail2ban,scripts,home/testuser/.ssh}
+          cp etc/ssh/sshd_config test-config/etc/ssh/
+          cp etc/fail2ban/jail.local test-config/etc/fail2ban/
+          cp scripts/* test-config/scripts/
+          echo "${{ secrets.TEST_SSH_PUBKEY }}" > test-config/home/testuser/.ssh/authorized_keys
+          chmod 600 test-config/home/testuser/.ssh/authorized_keys
+          chmod +x test-config/scripts/*.sh
+
+      - name: Build Test Container
+        run: docker build -t bastion-test .
+
+      - name: Run Container Tests
+        run: |
+          docker run -d --name test-container -p 2222:22 \
+            -v "$(pwd)/test-config:/tmp/server-config" bastion-test
+          sleep 20  # Increased wait time
+          
+          # Test SSH connectivity
+          ssh -p 2222 -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+            testuser@localhost echo "Container SSH test passed"
+          
+          # Verify services
+          docker exec test-container sudo ufw status | grep "Status: active"
+          docker exec test-container sudo fail2ban-client status sshd | grep "Status: active"
+
+      - name: Cleanup Containers
+        if: always()
+        run: |
+          docker stop test-container || true
+          docker rm test-container || true
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: test-configuration
+    if: ${{ github.ref == 'refs/heads/main' }}
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+      
+      - name: Get Runner IP
+        id: runner_ip
+        run: |
+          RUNNER_IP=$(curl -s https://api.ipify.org)
+          echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_OUTPUT
+          echo "::add-mask::$RUNNER_IP"
+
+      - name: Prepare Production Files
+        run: |
+          mkdir -p production-config
+          cp -r etc scripts home production-config/
+          chmod 600 production-config/home/root/.ssh/authorized_keys
+          chmod +x production-config/scripts/*.sh
+          
+          # Add runner IP to fail2ban ignore list
+          echo "[DEFAULT]" > production-config/etc/fail2ban/jail.d/gh-actions.conf
+          echo "ignoreip = ${{ steps.runner_ip.outputs.RUNNER_IP }}" >> production-config/etc/fail2ban/jail.d/gh-actions.conf
+
+      - name: Deploy to Server
+        uses: appleboy/scp-action@v1.0.0
         with:
-          host: ${{ github.event.inputs.target_host || secrets.BASTION_HOST }}
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "production-config/*"
+          target: "/tmp/server-config"
+          strip_components: 1
+
+      - name: Temporary IP Whitelisting
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            set -euo pipefail
-            CONFIG_DIR="/tmp/server-config-${{ github.run_id }}"
-            mkdir -p "$CONFIG_DIR"
-            
-            # Copy configuration via tar
-            tar -cf - . | ssh -o StrictHostKeyChecking=no \
-              ${{ secrets.SSH_USER }}@${{ github.event.inputs.target_host || secrets.BASTION_HOST }} \
-              "tar -xf - -C '$CONFIG_DIR'"
-            
-            # Execute configuration
-            sudo bash "$CONFIG_DIR/scripts/bastion-setup.sh" "$CONFIG_DIR"
-            
-            # Prepare logs for download
-            LOG_FILE="/var/log/server-config-$(date +%Y%m%d).log"
-            [ -f "$LOG_FILE" ] && sudo chmod 644 "$LOG_FILE"
+            sudo ufw allow from ${{ steps.runner_ip.outputs.RUNNER_IP }} to any port 22
+            echo "Temporary rule added for runner IP: ${{ steps.runner_ip.outputs.RUNNER_IP }}"
 
-      - name: Download Logs
-        if: always()
-        run: |
-          mkdir -p logs
-          scp -o StrictHostKeyChecking=no \
-            -i <(echo "${{ secrets.SSH_PRIVATE_KEY }}") \
-            ${{ secrets.SSH_USER }}@${{ github.event.inputs.target_host || secrets.BASTION_HOST }}:/var/log/server-config-*.log logs/ || echo "No logs found"
-          
-          # If no logs, create empty file to prevent workflow failure
-          [ -z "$(ls -A logs)" ] && touch logs/no-logs-found.txt
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
-        if: always()
+      - name: Run Setup
+        uses: appleboy/ssh-action@v1.2.0
         with:
-          name: bastion-logs-${{ github.run_id }}
-          path: logs
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # Maintain existing connections during setup
+            sudo sed -i 's/#TCPKeepAlive yes/TCPKeepAlive yes/g' /etc/ssh/sshd_config
+            sudo systemctl reload sshd
+            
+            # Execute with connection persistence
+            nohup sudo bash /tmp/server-config/scripts/bastion-setup.sh /tmp/server_config > /tmp/setup.log 2>&1 &
+            sleep 30  # Allow setup to initialize
+            
+            # Monitor setup progress
+            tail -f /tmp/setup.log &
+            SETUP_PID=$!
+            
+            # Wait for completion or timeout (600s = 10min)
+            timeout 600 tail --pid=$SETUP_PID -f /dev/null
+            sudo rm -rf /tmp/server-config
+
+      - name: Verify Setup
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            sudo sshd -t
+            sudo ufw status | grep "Status: active"
+            sudo fail2ban-client status sshd | grep "Status: active"
+            ssh -o StrictHostKeyChecking=no localhost echo "Production SSH verified"
+
+      - name: Remove Temporary Whitelist
+        if: always()
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            sudo ufw delete allow from ${{ steps.runner_ip.outputs.RUNNER_IP }} to any port 22
+            echo "Temporary rule removed"
+
+      - name: Final Security Check
+        run: |
+          # External verification from new connection
+          ssh -o StrictHostKeyChecking=no \
+            ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} \
+            "echo 'External connection verified'"
