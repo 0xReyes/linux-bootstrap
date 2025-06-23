@@ -36,8 +36,8 @@ create_backup() {
     sudo cp -a /etc/fail2ban "$BACKUP_DIR" || {
         echo "ERROR: Failed to backup Fail2ban config"; exit 1
     }
-    sudo netstat -tuln > "$BACKUP_DIR/netstat.txt"
-    sudo ps aux > "$BACKUP_DIR/processes.txt"
+    sudo sh -c "netstat -tuln > '$BACKUP_DIR/netstat.txt'"
+    sudo sh -c "ps aux > '$BACKUP_DIR/processes.txt'"
 }
 
 # Rollback function
